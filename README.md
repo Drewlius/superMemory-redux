@@ -1,3 +1,4 @@
+[![wakatime](https://wakatime.com/badge/github/Drewlius/oc-supermemory-redux.svg)](https://wakatime.com/badge/github/Drewlius/oc-supermemory-redux)
 # oc-supermemory-redux
 
 A focused [Supermemory](https://supermemory.ai/docs) plugin for OpenCode. It follows the current API contracts without legacy cross-editor tag discovery, custom compaction handling, or version-check banners.
