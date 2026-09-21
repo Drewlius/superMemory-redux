@@ -20,24 +20,24 @@ function extractFactText(fact: any): string {
   return JSON.stringify(fact);
 }
 
-function formatContext(profile: any, searchResults: any, config: Config): string { // # It appears as if we are wasting calls every turn pulling the entire profile which consists of approx 100 memories with metadata every turn also running a search on top of that. then slicing out all but 10% of the returned data. If i read correctly, this is going to waste so many tokens from the SuperMemory API.
+function formatContext(profile: any, searchResults: any, config: Config): string {
   const parts: string[] = ["[SUPERMEMORY]"];
   if (config.injectProfile && profile) {
     const staticFacts = profile.static ?? [];
     const dynamicFacts = profile.dynamic ?? [];
     if (staticFacts.length > 0) {
       parts.push("\nUser Profile:");
-      staticFacts.slice(0, 5).forEach((f: any) => parts.push(`- ${extractFactText(f)}`));  //# Are we only slicing 6 total static memories. Those are probably the most important and you get about 20 when profile is ran standalone.
+      staticFacts.forEach((f: any) => parts.push(`- ${extractFactText(f)}`));
     }
     if (dynamicFacts.length > 0) {
       parts.push("\nRecent Context:");
-      dynamicFacts.slice(0, 5).forEach((f: any) => parts.push(`- ${extractFactText(f)}`)); //# Are we only slicing 6 returned dynamic memories. It injects like 50 when profile is ran without any parameters
+      dynamicFacts.forEach((f: any) => parts.push(`- ${extractFactText(f)}`));
     }
   }
   const results = searchResults?.results ?? [];
   if (results.length > 0) {
     parts.push("\nRelevant Memories:");
-    results.slice(0, config.maxMemories).forEach((r: any) => { // #search AKA "query" aka q -> should be called with --limit mapped to (maxMemories) not throwing away what was sent to us and slicing it out.
+    results.forEach((r: any) => {
       const sim = Math.round((r.similarity ?? 0) * 100);
       const content = r.memory || r.chunk || "";
       parts.push(`- [${sim}%] ${content}`);
@@ -98,12 +98,30 @@ async function main() {
     }
 
     try {
-      const result = await sm.profile({ // # Profile should only be called once at the beginning of the conversation with a single --query aka {q} parameter. after which the only call should be search.
-        containerTag: config.containerTag,
-        q: userText, //# profile call with q aka query is good for the first injection but every turn after that should only be a supermemory serach --query  and the profile should not be repeatedly injected
-        threshold: config.similarityThreshold,
-      });
-      const contextText = formatContext(result.profile, result.searchResults, config);  // # Why are you passing config into the ephemeralMessage push?
+      const userMessageCount = chatHistory.filter((m: any) => m.source === "USER_EXPLICIT").length;
+      
+      let profileResult = null;
+      let searchResult = null;
+
+      if (userMessageCount === 1) {
+        const result = await sm.profile({
+          containerTag: config.containerTag,
+          q: userText,
+          threshold: config.similarityThreshold,
+        });
+        profileResult = result.profile;
+        searchResult = result.searchResults;
+      } else {
+        searchResult = await sm.search({
+          q: userText,
+          containerTag: config.containerTag,
+          searchMode: "hybrid",
+          limit: config.maxMemories,
+          threshold: config.similarityThreshold,
+        });
+      }
+
+      const contextText = formatContext(profileResult, searchResult, config);
       if (contextText) {
         injectSteps.push({ ephemeralMessage: contextText });
       }
@@ -115,7 +133,7 @@ async function main() {
     return;
   }
 
-  if (isStopHook) { // # When is stop hook firing. if it is only after the session has ended that is not going to work. if it is after you have completed your turn and are awaiting the USER_EXPLICIT userText that is okay.
+  if (isStopHook) {
     // Ingest conversation
     const conversationMessages = [];
     for (const msg of chatHistory) {
@@ -124,7 +142,7 @@ async function main() {
       } else if (msg.source === "MODEL" && msg.type === "PLANNER_RESPONSE") {
         const text = msg.content || "";
         if (text) {
-          conversationMessages.push({ role: "assistant", content: text }); //# are the turns consisting of model and user messages being concat. together to provide a full turn worth of info info.
+          conversationMessages.push({ role: "assistant", content: text });
         }
       }
     }
@@ -138,7 +156,7 @@ async function main() {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            conversationId: `session_${payload.conversationId}`, // # Does antigravity even emit a conversationId to hook into? This is really important is this is how the upstream keeps concurrency of the chat history during per turn ingestion and dynamic "dreaming"
+            conversationId: `session_${payload.conversationId}`,
             messages: conversationMessages,
             containerTags: [config.containerTag],
             metadata: { source: "antigravity", model: payload.modelName },
@@ -148,11 +166,11 @@ async function main() {
         console.error("Ingest error:", e);
       }
     }
-    console.log(JSON.stringify({}));    //#  what exactly are you logging here?
+    console.log(JSON.stringify({}));
     return;
   }
 
-  console.log("{}");     //#  what exactly are you logging here?
+  console.log("{}");
 }
 
 main().catch(() => console.log("{}"));

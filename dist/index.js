@@ -1595,19 +1595,19 @@ function formatContext(profile, searchResults, config) {
     if (staticFacts.length > 0) {
       parts.push(`
 User Profile:`);
-      staticFacts.slice(0, 5).forEach((f) => parts.push(`- ${extractFactText(f)}`));
+      staticFacts.forEach((f) => parts.push(`- ${extractFactText(f)}`));
     }
     if (dynamicFacts.length > 0) {
       parts.push(`
 Recent Context:`);
-      dynamicFacts.slice(0, 5).forEach((f) => parts.push(`- ${extractFactText(f)}`));
+      dynamicFacts.forEach((f) => parts.push(`- ${extractFactText(f)}`));
     }
   }
   const results = searchResults?.results ?? [];
   if (results.length > 0) {
     parts.push(`
 Relevant Memories:`);
-    results.slice(0, config.maxMemories).forEach((r) => {
+    results.forEach((r) => {
       const sim = Math.round((r.similarity ?? 0) * 100);
       const content = r.memory || r.chunk || "";
       parts.push(`- [${sim}%] ${content}`);
@@ -1661,12 +1661,27 @@ async function main() {
       injectSteps.push({ ephemeralMessage: SAVE_NUDGE });
     }
     try {
-      const result = await sm.profile({
-        containerTag: config.containerTag,
-        q: userText,
-        threshold: config.similarityThreshold
-      });
-      const contextText = formatContext(result.profile, result.searchResults, config);
+      const userMessageCount = chatHistory.filter((m) => m.source === "USER_EXPLICIT").length;
+      let profileResult = null;
+      let searchResult = null;
+      if (userMessageCount === 1) {
+        const result = await sm.profile({
+          containerTag: config.containerTag,
+          q: userText,
+          threshold: config.similarityThreshold
+        });
+        profileResult = result.profile;
+        searchResult = result.searchResults;
+      } else {
+        searchResult = await sm.search({
+          q: userText,
+          containerTag: config.containerTag,
+          searchMode: "hybrid",
+          limit: config.maxMemories,
+          threshold: config.similarityThreshold
+        });
+      }
+      const contextText = formatContext(profileResult, searchResult, config);
       if (contextText) {
         injectSteps.push({ ephemeralMessage: contextText });
       }
