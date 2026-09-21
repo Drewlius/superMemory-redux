@@ -1,8 +1,7 @@
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import type { Part } from "@opencode-ai/sdk";
-import { tool } from "@opencode-ai/plugin";
+#!/usr/bin/env bun
 import Supermemory from "supermemory";
 import { loadConfig, type Config } from "./config.js";
+import { readFileSync } from "node:fs";
 
 const KEYWORD_PATTERN = /\b(remember|memorize|save\s+this|note\s+this|keep\s+in\s+mind|don'?t\s+forget|learn\s+this|store\s+this|record\s+this|make\s+a\s+note|take\s+note|jot\s+down|commit\s+to\s+memory|never\s+forget|always\s+remember|log\s+this|write\s+down)\b/i;
 
@@ -13,580 +12,147 @@ Extract the key information and save it as a concise, searchable memory.
 
 DO NOT skip this step. The user explicitly asked you to remember.`;
 
-function extractFactText(fact: unknown): string {
+function extractFactText(fact: any): string {
   if (typeof fact === "string") return fact;
-  const obj = fact as Record<string, unknown>;
-  if (obj?.text) return String(obj.text);
-  if (obj?.content) return String(obj.content);
-  if (obj?.fact) return String(obj.fact);
+  if (fact?.text) return String(fact.text);
+  if (fact?.content) return String(fact.content);
+  if (fact?.fact) return String(fact.fact);
   return JSON.stringify(fact);
 }
 
-function formatContext(
-  profile: { static?: unknown[]; dynamic?: unknown[] } | null,
-  searchResults: { results?: Array<{ memory?: string; chunk?: string; similarity?: number }> } | null,
-  config: Config,
-): string {
+function formatContext(profile: any, searchResults: any, config: Config): string { // # It appears as if we are wasting calls every turn pulling the entire profile which consists of approx 100 memories with metadata every turn also running a search on top of that. then slicing out all but 10% of the returned data. If i read correctly, this is going to waste so many tokens from the SuperMemory API.
   const parts: string[] = ["[SUPERMEMORY]"];
-
   if (config.injectProfile && profile) {
     const staticFacts = profile.static ?? [];
     const dynamicFacts = profile.dynamic ?? [];
-
     if (staticFacts.length > 0) {
       parts.push("\nUser Profile:");
-      staticFacts.slice(0, 5).forEach((f) => parts.push(`- ${extractFactText(f)}`));
+      staticFacts.slice(0, 5).forEach((f: any) => parts.push(`- ${extractFactText(f)}`));  //# Are we only slicing 6 total static memories. Those are probably the most important and you get about 20 when profile is ran standalone.
     }
-
     if (dynamicFacts.length > 0) {
       parts.push("\nRecent Context:");
-      dynamicFacts.slice(0, 5).forEach((f) => parts.push(`- ${extractFactText(f)}`));
+      dynamicFacts.slice(0, 5).forEach((f: any) => parts.push(`- ${extractFactText(f)}`)); //# Are we only slicing 6 returned dynamic memories. It injects like 50 when profile is ran without any parameters
     }
   }
-
   const results = searchResults?.results ?? [];
   if (results.length > 0) {
     parts.push("\nRelevant Memories:");
-    results.slice(0, config.maxMemories).forEach((r) => {
+    results.slice(0, config.maxMemories).forEach((r: any) => { // #search AKA "query" aka q -> should be called with --limit mapped to (maxMemories) not throwing away what was sent to us and slicing it out.
       const sim = Math.round((r.similarity ?? 0) * 100);
       const content = r.memory || r.chunk || "";
       parts.push(`- [${sim}%] ${content}`);
     });
   }
-
   if (parts.length === 1) return "";
   return parts.join("\n");
 }
 
-export const SupermemoryRedux: Plugin = async (ctx: PluginInput) => {
-  const { client } = ctx;
-  let lastErrorNoticeAt = 0;
-
-  const notifyError = async (message: string, throttle = true) => {
-    const now = Date.now();
-    if (throttle && now - lastErrorNoticeAt < 30_000) return;
-    lastErrorNoticeAt = now;
-
-    const visibleMessage = message.length > 500 ? `${message.slice(0, 497)}...` : message;
-    try {
-      await client.tui.showToast({
-        body: {
-          title: "Supermemory Redux",
-          message: visibleMessage,
-          variant: "error",
-          duration: 10_000,
-        },
-        query: { directory: ctx.directory },
-      });
-    } catch {}
-  };
+async function main() {
+  const inputChunks: Buffer[] = [];
+  for await (const chunk of process.stdin) inputChunks.push(chunk);
+  const inputData = Buffer.concat(inputChunks).toString("utf-8");
+  if (!inputData) {
+    console.log("{}");
+    return;
+  }
+  
+  let payload: any;
+  try {
+    payload = JSON.parse(inputData);
+  } catch (e) {
+    console.log("{}");
+    return;
+  }
 
   let config: Config;
   try {
     config = loadConfig();
   } catch (e) {
-    const message = `Configuration failed: ${e instanceof Error ? e.message : String(e)}`;
-    await notifyError(message, false);
-    await client.app.log({
-      body: {
-        service: "oc-supermemory-redux",
-        level: "error",
-        message,
-      },
-    });
-    return {};
+    console.error(e);
+    console.log("{}");
+    return;
   }
 
-  const sm = new Supermemory({
-    apiKey: config.apiKey,
-    baseURL: config.baseUrl,
-  });
+  const sm = new Supermemory({ apiKey: config.apiKey, baseURL: config.baseUrl });
 
-  let entityContextSynced = false;
-  const syncEntityContext = async () => {
-    if (entityContextSynced) return;
+  const transcriptLines = readFileSync(payload.transcriptPath, "utf-8").trim().split("\n");
+  const messages = transcriptLines.map((line) => JSON.parse(line));
+  
+  // Identify user/assistant messages
+  const chatHistory = messages.filter((m: any) => m.source === "USER_EXPLICIT" || m.source === "MODEL");
+  
+  const isStopHook = payload.terminationReason !== undefined;
+  const isPreInvocationHook = payload.invocationNum !== undefined && !isStopHook;
 
-    const response = await fetch(
-      `${config.baseUrl.replace(/\/$/, "")}/v3/container-tags/${encodeURIComponent(config.containerTag)}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${config.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ entityContext: config.entityContext }),
-      },
-    );
-
-    if (response.status === 404) return;
-    if (!response.ok) {
-      throw new Error(`Entity context synchronization failed (${response.status}): ${await response.text()}`);
+  if (isPreInvocationHook) {
+    const lastMsg = chatHistory[chatHistory.length - 1];
+    if (lastMsg?.source !== "USER_EXPLICIT") {
+      console.log(JSON.stringify({ injectSteps: [] }));
+      return;
     }
-    entityContextSynced = true;
-  };
+    const userText = lastMsg.content || "";
+    
+    const injectSteps = [];
+    if (KEYWORD_PATTERN.test(userText)) {
+      injectSteps.push({ ephemeralMessage: SAVE_NUDGE });
+    }
 
-  const trySyncEntityContext = async () => {
     try {
-      await syncEntityContext();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      await notifyError(message);
-      await client.app.log({
-        body: {
-          service: "oc-supermemory-redux",
-          level: "error",
-          message,
-        },
+      const result = await sm.profile({ // # Profile should only be called once at the beginning of the conversation with a single --query aka {q} parameter. after which the only call should be search.
+        containerTag: config.containerTag,
+        q: userText, //# profile call with q aka query is good for the first injection but every turn after that should only be a supermemory serach --query  and the profile should not be repeatedly injected
+        threshold: config.similarityThreshold,
       });
+      const contextText = formatContext(result.profile, result.searchResults, config);  // # Why are you passing config into the ephemeralMessage push?
+      if (contextText) {
+        injectSteps.push({ ephemeralMessage: contextText });
+      }
+    } catch (e) {
+      console.error(e);
     }
-  };
 
-  await client.app.log({
-    body: {
-      service: "oc-supermemory-redux",
-      level: "info",
-      message: "Plugin initialized",
-      extra: { containerTag: config.containerTag, baseUrl: config.baseUrl },
-    },
-  });
-  await trySyncEntityContext();
+    console.log(JSON.stringify({ injectSteps }));
+    return;
+  }
 
-  const ingestedMessageIds = new Set<string>();
-  const profiledSessions = new Set<string>();
-  const sessionModels = new Map<string, string>();
-
-  return {
-    "chat.message": async (input, output) => {
-      const textParts = output.parts.filter(
-        (p): p is Part & { type: "text"; text: string } => p.type === "text",
-      );
-      if (textParts.length === 0) return;
-
-      const userMessage = textParts.map((p) => p.text).join("\n");
-      if (!userMessage.trim()) return;
-
-      if (input.model?.modelID) sessionModels.set(input.sessionID, input.model.modelID);
-
-      if (KEYWORD_PATTERN.test(userMessage)) {
-        output.parts.push({
-          id: `prt_sm-nudge-${Date.now()}`,
-          sessionID: input.sessionID,
-          messageID: output.message.id,
-          type: "text",
-          text: SAVE_NUDGE,
-          synthetic: true,
-        });
+  if (isStopHook) { // # When is stop hook firing. if it is only after the session has ended that is not going to work. if it is after you have completed your turn and are awaiting the USER_EXPLICIT userText that is okay.
+    // Ingest conversation
+    const conversationMessages = [];
+    for (const msg of chatHistory) {
+      if (msg.source === "USER_EXPLICIT" && msg.content) {
+        conversationMessages.push({ role: "user", content: msg.content });
+      } else if (msg.source === "MODEL" && msg.type === "PLANNER_RESPONSE") {
+        const text = msg.content || "";
+        if (text) {
+          conversationMessages.push({ role: "assistant", content: text }); //# are the turns consisting of model and user messages being concat. together to provide a full turn worth of info info.
+        }
       }
+    }
 
+    if (conversationMessages.length > 0) {
       try {
-        let profile: { static?: unknown[]; dynamic?: unknown[] } | null = null;
-        let searchResults: { results?: Array<{ memory?: string; chunk?: string; similarity?: number }> } | null = null;
-
-        if (!profiledSessions.has(input.sessionID)) {
-          const result = await sm.profile({
-            containerTag: config.containerTag,
-            q: userMessage,
-            threshold: config.similarityThreshold,
-          });
-          profile = result.profile ?? null;
-          searchResults = (result.searchResults as {
-            results?: Array<{ memory?: string; chunk?: string; similarity?: number }>;
-          } | undefined) ?? null;
-          profiledSessions.add(input.sessionID);
-        } else {
-          searchResults = await sm.search({
-            q: userMessage,
-            containerTag: config.containerTag,
-            searchMode: "memories",
-            limit: config.maxMemories,
-            threshold: config.similarityThreshold,
-          });
-        }
-
-        const contextText = formatContext(
-          profile,
-          searchResults,
-          config,
-        );
-
-        if (contextText) {
-          output.parts.unshift({
-            id: `prt_sm-context-${Date.now()}`,
-            sessionID: input.sessionID,
-            messageID: output.message.id,
-            type: "text",
-            text: contextText,
-            synthetic: true,
-          });
-        }
+        const res = await fetch(`${config.baseUrl.replace(/\/$/, "")}/v4/conversations`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            conversationId: `session_${payload.conversationId}`, // # Does antigravity even emit a conversationId to hook into? This is really important is this is how the upstream keeps concurrency of the chat history during per turn ingestion and dynamic "dreaming"
+            messages: conversationMessages,
+            containerTags: [config.containerTag],
+            metadata: { source: "antigravity", model: payload.modelName },
+          }),
+        });
       } catch (e) {
-        const message = `Memory recall failed: ${e instanceof Error ? e.message : String(e)}`;
-        await notifyError(message);
-        await client.app.log({
-          body: {
-            service: "oc-supermemory-redux",
-            level: "error",
-            message,
-          },
-        });
+        console.error("Ingest error:", e);
       }
+    }
+    console.log(JSON.stringify({}));    //#  what exactly are you logging here?
+    return;
+  }
 
-      try {
-          const response = await ctx.client.session.messages({
-            path: { id: input.sessionID },
-            query: { directory: ctx.directory },
-          });
-          if (response.error) {
-            throw new Error(`OpenCode message retrieval failed: ${JSON.stringify(response.error)}`);
-          }
+  console.log("{}");     //#  what exactly are you logging here?
+}
 
-          const msgs = response.data ?? [];
-
-          if (!ingestedMessageIds.has(output.message.id)) {
-            const previousAssistant = [...msgs].reverse().find((msg) => msg.info.role === "assistant");
-            const assistantText = previousAssistant?.parts
-              .filter((p): p is Part & { type: "text"; text: string } => p.type === "text" && !p.synthetic)
-              .map((p) => p.text)
-              .join("\n")
-              .trim();
-            const turnModel = (previousAssistant?.info as { modelID?: string } | undefined)?.modelID;
-            const assistantContent = assistantText
-              ? turnModel
-                ? `[model: ${turnModel}]\n${assistantText}`
-                : assistantText
-              : undefined;
-            const conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
-            if (assistantContent) conversationMessages.push({ role: "assistant", content: assistantContent });
-            conversationMessages.push({ role: "user", content: userMessage });
-
-            const conversationResponse = await fetch(`${config.baseUrl.replace(/\/$/, "")}/v4/conversations`, {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${config.apiKey}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                conversationId: `session_${input.sessionID}`,
-                messages: conversationMessages,
-                containerTags: [config.containerTag],
-                metadata: {
-                  source: "opencode",
-                  model: input.model?.modelID,
-                },
-              }),
-            });
-            if (!conversationResponse.ok) {
-              throw new Error(
-                `Conversation ingestion failed (${conversationResponse.status}): ${await conversationResponse.text()}`,
-              );
-            }
-            await trySyncEntityContext();
-
-            ingestedMessageIds.add(output.message.id);
-
-            await client.app.log({
-              body: {
-                service: "oc-supermemory-redux",
-                level: "info",
-                message: "Conversation ingested on chat.message",
-                extra: {
-                  sessionID: input.sessionID,
-                  messageCount: conversationMessages.length,
-                  contentLength: JSON.stringify(conversationMessages).length,
-                  containerTag: config.containerTag,
-                },
-              },
-            });
-          }
-      } catch (ingestErr) {
-        const message = `Conversation ingestion failed: ${ingestErr instanceof Error ? ingestErr.message : String(ingestErr)}`;
-        await notifyError(message);
-        await client.app.log({
-          body: {
-            service: "oc-supermemory-redux",
-            level: "warn",
-            message,
-          },
-        });
-      }
-    },
-
-    tool: {
-      supermemory: tool({
-        description:
-          "Manage and query the Supermemory persistent memory system. " +
-          "Use 'search' to find relevant memories, 'add' to store new knowledge, " +
-          "'update' to correct an existing memory, " +
-          "'profile' to view user profile, 'list' to see recent documents, " +
-          "'get' to retrieve a complete document, " +
-          "'forget' to remove a memory.",
-        args: {
-          mode: tool.schema
-            .enum(["add", "update", "search", "profile", "list", "get", "forget"])
-            .optional(),
-          content: tool.schema.string().optional(),
-          newContent: tool.schema.string().optional(),
-          query: tool.schema.string().optional(),
-          memoryId: tool.schema.string().optional(),
-          documentId: tool.schema.string().optional(),
-          limit: tool.schema.number().optional(),
-          reason: tool.schema.string().optional(),
-        },
-        async execute(args: {
-          mode?: string;
-          content?: string;
-          newContent?: string;
-          query?: string;
-          memoryId?: string;
-          documentId?: string;
-          limit?: number;
-          reason?: string;
-        }, context: { sessionID: string }) {
-          const mode = args.mode || "help";
-          const toolModel = sessionModels.get(context.sessionID);
-
-          try {
-            switch (mode) {
-              case "add": {
-                if (!args.content) {
-                  return JSON.stringify({
-                    success: false,
-                    error: "content is required for add mode",
-                  });
-                }
-
-                const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/v4/memories`, {
-                  method: "POST",
-                  headers: {
-                    Authorization: `Bearer ${config.apiKey}`,
-                    "Content-Type": "application/json",
-                  },
-                  body: JSON.stringify({
-                    memories: [{
-                      content: args.content,
-                      isStatic: false,
-                      metadata: {
-                        source: "opencode",
-                        ...(toolModel ? { model: toolModel } : {}),
-                      },
-                    },
-                  ],
-                    containerTag: config.containerTag,
-                  }),
-                });
-                if (!response.ok) {
-                  throw new Error(`Direct memory creation failed (${response.status}): ${await response.text()}`);
-                }
-                await trySyncEntityContext();
-
-                const result = await response.json() as {
-                  documentId: string | null;
-                  memories: Array<{ id: string }>;
-                };
-
-                return JSON.stringify({
-                  success: true,
-                  id: result.memories[0]?.id,
-                  documentId: result.documentId,
-                  containerTag: config.containerTag,
-                });
-              }
-
-              case "search": {
-                if (!args.query) {
-                  return JSON.stringify({
-                    success: false,
-                    error: "query is required for search mode",
-                  });
-                }
-
-                const results = await sm.search({
-                  q: args.query,
-                  containerTag: config.containerTag,
-                  searchMode: "memories",
-                  limit: args.limit || config.maxMemories,
-                  threshold: config.similarityThreshold,
-                });
-
-                const searchResults = results as {
-                  results?: Array<{
-                    id?: string;
-                    memory?: string;
-                    chunk?: string;
-                    similarity?: number;
-                  }>;
-                };
-
-                return JSON.stringify({
-                  success: true,
-                  query: args.query,
-                  count: searchResults.results?.length ?? 0,
-                  results: (searchResults.results ?? []).map((r) => ({
-                    id: r.id,
-                    content: r.memory || r.chunk,
-                    similarity: Math.round((r.similarity ?? 0) * 100),
-                  })),
-                });
-              }
-
-              case "update": {
-                if (!args.memoryId || !args.newContent) {
-                  return JSON.stringify({
-                    success: false,
-                    error: "memoryId and newContent are required for update mode",
-                  });
-                }
-
-                const result = await sm.memories.updateMemory({
-                  id: args.memoryId,
-                  newContent: args.newContent,
-                  containerTag: config.containerTag,
-                  metadata: {
-                    source: "opencode",
-                    ...(toolModel ? { model: toolModel } : {}),
-                  },
-                });
-
-                return JSON.stringify({
-                  success: true,
-                  id: result.id,
-                  memory: result.memory,
-                  parentMemoryId: result.parentMemoryId,
-                  rootMemoryId: result.rootMemoryId,
-                  version: result.version,
-                  createdAt: result.createdAt,
-                });
-              }
-
-              case "profile": {
-                const result = await sm.profile({
-                  containerTag: config.containerTag,
-                  q: args.query,
-                });
-
-                const p = result as {
-                  profile?: { static?: unknown[]; dynamic?: unknown[] };
-                };
-
-                return JSON.stringify({
-                  success: true,
-                  profile: {
-                    static: p.profile?.static ?? [],
-                    dynamic: p.profile?.dynamic ?? [],
-                  },
-                });
-              }
-
-              case "list": {
-                const result = await sm.documents.list({
-                  containerTags: [config.containerTag],
-                  limit: args.limit || 20,
-                  sort: "createdAt",
-                  order: "desc",
-                });
-
-                return JSON.stringify({
-                  success: true,
-                  count: result.memories.length,
-                  memories: result.memories.map((d) => ({
-                    id: d.id,
-                    customId: d.customId,
-                    title: d.title,
-                    summary: d.summary,
-                    type: d.type,
-                    status: d.status,
-                    createdAt: d.createdAt,
-                    updatedAt: d.updatedAt,
-                  })),
-                });
-              }
-
-              case "get": {
-                if (!args.documentId) {
-                  return JSON.stringify({
-                    success: false,
-                    error: "documentId is required for get mode",
-                  });
-                }
-
-                const document = await sm.documents.get(args.documentId);
-
-                return JSON.stringify({
-                  success: true,
-                  document: {
-                    id: document.id,
-                    customId: document.customId,
-                    title: document.title,
-                    summary: document.summary,
-                    type: document.type,
-                    status: document.status,
-                    content: document.content,
-                    source: document.source,
-                    url: document.url,
-                    filepath: document.filepath,
-                    metadata: document.metadata,
-                    createdAt: document.createdAt,
-                    updatedAt: document.updatedAt,
-                  },
-                });
-              }
-
-              case "forget": {
-                if (!args.memoryId && !args.content) {
-                  return JSON.stringify({
-                    success: false,
-                    error: "memoryId or exact content is required for forget mode",
-                  });
-                }
-
-                let result;
-                try {
-                  result = await sm.memories.forget({
-                    ...(args.memoryId ? { id: args.memoryId } : { content: args.content }),
-                    containerTag: config.containerTag,
-                    ...(args.reason ? { reason: args.reason } : {}),
-                  });
-                } catch (error) {
-                  const isNotFound = error instanceof Error && error.message.includes("404");
-                  if (!args.memoryId || !args.content || !isNotFound) throw error;
-                  result = await sm.memories.forget({
-                    content: args.content,
-                    containerTag: config.containerTag,
-                    ...(args.reason ? { reason: args.reason } : {}),
-                  });
-                }
-
-                return JSON.stringify({
-                  success: true,
-                  id: result.id,
-                  forgotten: result.forgotten,
-                });
-              }
-
-              default:
-                return JSON.stringify({
-                  success: true,
-                  message: "Supermemory Redux Usage Guide",
-                  containerTag: config.containerTag,
-                  commands: [
-                    { command: "add", description: "Store a new memory", args: ["content"] },
-                    { command: "update", description: "Correct an existing memory", args: ["memoryId", "newContent"] },
-                    { command: "search", description: "Search memories (hybrid mode)", args: ["query", "limit?"] },
-                    { command: "profile", description: "View user profile", args: ["query?"] },
-                    { command: "list", description: "List recent documents", args: ["limit?"] },
-                    { command: "get", description: "Retrieve a complete document", args: ["documentId"] },
-                    { command: "forget", description: "Remove a memory", args: ["memoryId?", "content?", "reason?"] },
-                  ],
-                });
-            }
-          } catch (e) {
-            return JSON.stringify({
-              success: false,
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
-        },
-      }),
-    },
-  };
-};
+main().catch(() => console.log("{}"));
