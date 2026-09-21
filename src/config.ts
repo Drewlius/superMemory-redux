@@ -78,10 +78,13 @@ function stripJsoncComments(content: string): string {
 }
 
 function loadConfigFile(): Record<string, unknown> | null {
-  const configDir = join(homedir(), ".config", "opencode");
+  const opencodeDir = join(homedir(), ".config", "opencode");
+  const antigravityDir = join(homedir(), ".gemini", "config");
   const paths = [
-    join(configDir, "supermemory.jsonc"),
-    join(configDir, "supermemory.json"),
+    join(antigravityDir, "supermemory.jsonc"),
+    join(antigravityDir, "supermemory.json"),
+    join(opencodeDir, "supermemory.jsonc"),
+    join(opencodeDir, "supermemory.json"),
   ];
 
   for (const path of paths) {
@@ -112,19 +115,23 @@ function loadApiKey(fileConfig: Record<string, unknown> | null): string | undefi
     return fileConfig.apiKey;
   }
 
+  const antigravityCreds = join(homedir(), ".gemini", "config", "supermemory-credentials.json");
   const opencodeCreds = join(homedir(), ".config", "opencode", "supermemory-credentials.json");
-  if (existsSync(opencodeCreds)) {
-    try {
-      const c = JSON.parse(readFileSync(opencodeCreds, "utf-8"));
-      if (c.apiKey !== undefined) {
-        if (typeof c.apiKey !== "string" || !c.apiKey.trim()) {
-          throw new Error(`apiKey in ${opencodeCreds} must be a non-empty string`);
+  
+  for (const credFile of [antigravityCreds, opencodeCreds]) {
+    if (existsSync(credFile)) {
+      try {
+        const c = JSON.parse(readFileSync(credFile, "utf-8"));
+        if (c.apiKey !== undefined) {
+          if (typeof c.apiKey !== "string" || !c.apiKey.trim()) {
+            throw new Error(`apiKey in ${credFile} must be a non-empty string`);
+          }
+          return c.apiKey;
         }
-        return c.apiKey;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`Failed to parse ${credFile}: ${msg}`);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(`Failed to parse ${opencodeCreds}: ${msg}`);
     }
   }
 
@@ -138,8 +145,8 @@ export function loadConfig(): Config {
   if (!apiKey) {
     throw new Error(
       "No Supermemory API key found. Set SUPERMEMORY_API_KEY env var, " +
-      "add apiKey to ~/.config/opencode/supermemory.jsonc, or create " +
-      "~/.config/opencode/supermemory-credentials.json with {\"apiKey\": \"sm_...\"}"
+      "add apiKey to ~/.gemini/config/supermemory.jsonc, or create " +
+      "~/.gemini/config/supermemory-credentials.json with {\"apiKey\": \"sm_...\"}"
     );
   }
 

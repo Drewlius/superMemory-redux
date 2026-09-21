@@ -1,0 +1,19 @@
+{
+  "supermemory-logger": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "bun run /path/to/oc-supermemory-redux/dist/index.js",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bun run /path/to/oc-supermemory-redux/dist/index.js",
+        "timeout": 10
+      }
+    ]
+  }
+}
